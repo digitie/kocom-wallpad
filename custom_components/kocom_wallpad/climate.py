@@ -6,6 +6,7 @@ from typing import Any, List
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
+    ATTR_HVAC_MODE,
     ClimateEntityFeature,
     HVACMode,
 )
@@ -122,5 +123,7 @@ class KocomClimate(KocomBaseEntity, ClimateEntity):
         await self.gateway.async_send_action(self._device.key, "set_preset", **args)
 
     async def async_set_temperature(self, **kwargs) -> None:
+        if ATTR_HVAC_MODE in kwargs:
+            await self.async_set_hvac_mode(kwargs[ATTR_HVAC_MODE])
         args = {"target_temp": float(kwargs[ATTR_TEMPERATURE])}
         await self.gateway.async_send_action(self._device.key, "set_temperature", **args)

@@ -28,6 +28,8 @@ IDLE_GAP_SEC = 0.20   # 보내기 전 라인 유휴로 보고 싶은 최소 간�
 SEND_RETRY_MAX = 3
 SEND_RETRY_GAP = 0.15
 CMD_CONFIRM_TIMEOUT = 1.0  # 보낸 뒤 상태 확인을 기다리는 최대 시간
+MAX_TX_QUEUE_SIZE = 50     # 전송 대기열 최대 길이 (초과 시 새 명령 거부)
+CMD_STALE_AFTER_SEC = 30.0  # 대기열에서 이보다 오래 기다린 명령은 전송하지 않고 폐기
 
 class DeviceType(IntEnum):
     """Device types."""

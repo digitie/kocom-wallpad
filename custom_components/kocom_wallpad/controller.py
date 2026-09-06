@@ -122,8 +122,13 @@ class KocomController:
         while True:
             start = buf.find(PACKET_PREFIX)
             if start < 0:
-                # 프리픽스 이전의 쓰레기 데이터 제거
-                buf.clear()
+                # 프리픽스 이전의 쓰레기 데이터 제거. 단, 버퍼 끝이 프리픽스의
+                # 시작 바이트로 끝나는 경우 다음 feed() 호출에서 프리픽스가
+                # 완성될 수 있으므로 그 바이트는 남겨둔다.
+                if buf and buf[-1] == PACKET_PREFIX[0]:
+                    del buf[:-1]
+                else:
+                    buf.clear()
                 break
             if start > 0:
                 del buf[:start]
@@ -186,7 +191,7 @@ class KocomController:
     def _handle_cutoff_switch(self, frame: PacketFrame) -> DeviceState:
         if frame.command in (0x65, 0x66):
             key = DeviceKey(
-                device_type=frame.dev_type,
+                device_type=DeviceType.LIGHTCUTOFF,
                 room_index=0,
                 device_index=0,
                 sub_type=SubType.NONE,
@@ -247,9 +252,6 @@ class KocomController:
                 "target_temp": self._device_storage.get(f"{key.unique_id}_thermo_target", target_temp),
                 "current_temp": self._device_storage.get(f"{key.unique_id}_thermo_current", current_temp),
             }
-            if target_temp % 1 == 0.5 and self._device_storage.get(f"{key.unique_id}_thermo_step") != 0.5:
-                LOGGER.debug("0.5°C step detected, heating supports 0.5 increments.")
-                self._device_storage[f"{key.unique_id}_thermo_step"] = 0.5
             if target_temp != 0 and current_temp != 0:
                 if havc_mode == HVACMode.HEAT and self._device_storage.get(f"{key.unique_id}_thermo_target") != target_temp:
                     LOGGER.debug(f"User target temperature update: {target_temp}")
@@ -552,7 +554,7 @@ class KocomController:
         # 밸브는 동작이 느릴 수 있으니 기본 타임아웃 상향
         base_timeout = max(CMD_CONFIRM_TIMEOUT, 1.5)
         if action == "turn_on":
-            return True, base_timeout
+            return self._match_key_and(key, lambda d: bool(d.state) is True), base_timeout
         if action == "turn_off":
             return self._match_key_and(key, lambda d: bool(d.state) is False), base_timeout
         return self._match_key_and(key, lambda _d: False), base_timeout
@@ -612,26 +614,33 @@ class KocomController:
         device_index = key.device_index
         sub_type = key.sub_type
 
-        if device_type not in REV_DT_MAP:
+        if device_type not in REV_DT_MAP and device_type != DeviceType.LIGHTCUTOFF:
             raise ValueError(f"Invalid device type: {device_type}")
 
         type_bytes = bytes([0x30, 0xBC])
         padding = bytes([0x00])
-        dest_dev = bytes([REV_DT_MAP[device_type]])
-        dest_room = bytes([room_index & 0xFF])
+        # LIGHTCUTOFF isn't a distinct device on the wire - it's the LIGHT
+        # device code (0x0E) addressed to the special "all rooms" room 0xFF,
+        # confirmed from _handle_cutoff_switch's parse side (frame.dev_type
+        # == LIGHT, frame.dev_room == 0xFF, command 0x65/0x66). Not verified
+        # against real hardware - please confirm before relying on it.
+        dest_dev = bytes([REV_DT_MAP[DeviceType.LIGHT] if device_type == DeviceType.LIGHTCUTOFF else REV_DT_MAP[device_type]])
+        dest_room = bytes([0xFF if device_type == DeviceType.LIGHTCUTOFF else room_index & 0xFF])
         src_dev = bytes([0x01])
         src_room = bytes([0x00])
         command = bytes([0x00])
         data = bytearray(8)
 
-        if device_type in (DeviceType.LIGHT, DeviceType.OUTLET):
+        if device_type == DeviceType.LIGHTCUTOFF:
+            command = bytes([0x65 if action == "turn_on" else 0x66])
+        elif device_type in (DeviceType.LIGHT, DeviceType.OUTLET):
             data = self._generate_switch(key, action, data)
         elif device_type == DeviceType.VENTILATION:
-            data = self._generate_ventilation(action, data, **kwargs)
+            data = self._generate_ventilation(key, action, data, **kwargs)
         elif device_type == DeviceType.THERMOSTAT:
-            data = self._generate_thermostat(action, data, **kwargs)
+            data = self._generate_thermostat(key, action, data, **kwargs)
         elif device_type == DeviceType.AIRCONDITIONER:
-            data = self._generate_airconditioner(action, data, **kwargs)
+            data = self._generate_airconditioner(key, action, data, **kwargs)
         elif device_type == DeviceType.GASVALVE:
             command = bytes([0x02])
         elif device_type == DeviceType.ELEVATOR:
@@ -652,16 +661,29 @@ class KocomController:
 
     def _generate_switch(self, key: DeviceKey, action: str, data: bytes) -> bytes:
         for idx in range(8):
+            if idx == key.device_index:
+                data[idx] = 0xFF if action == "turn_on" else 0x00
+                continue
             new_key = replace(key, device_index=idx)
             st = self.gateway.registry.get(new_key)
-            if idx != key.device_index:
-                bit = 0xFF if (st and st.state is True) else 0x00
-                data[idx] = bit
-            else:
-                data[idx] = 0xFF if action == "turn_on" else 0x00
+            if st is None:
+                # We don't know this channel's real state yet (e.g. right after
+                # HA restart, before its first status broadcast arrives). This
+                # command rebuilds the whole 8-channel group packet, so
+                # guessing "off" here would actually switch off a light/outlet
+                # that may currently be on. Refuse instead of guessing.
+                raise ValueError(
+                    f"Cannot build switch command for {key}: state of sibling "
+                    f"channel {new_key} in the same room is not yet known."
+                )
+            data[idx] = 0xFF if st.state is True else 0x00
         return data
 
-    def _generate_ventilation(self, action: str, data: bytes, **kwargs: Any) -> bytes:
+    def _generate_ventilation(self, key: DeviceKey, action: str, data: bytes, **kwargs: Any) -> bytes:
+        current = self.gateway.registry.get(key)
+        cur_state = current.state if current and isinstance(current.state, dict) else {}
+        cur_preset_byte = REV_VENT_PRESET_MAP.get(cur_state.get("preset_mode"))
+
         if action == "set_preset":
             pm = kwargs["preset_mode"]
             data[0] = 0x11
@@ -669,41 +691,60 @@ class KocomController:
         elif action == "set_percentage":
             speed = kwargs["speed"]
             data[0] = 0x00 if speed == 0 else 0x11
+            if cur_preset_byte is not None:
+                data[1] = cur_preset_byte
             data[2] = speed
         else:
             data[0] = 0x11 if action == "turn_on" else 0x00
+            if cur_preset_byte is not None:
+                data[1] = cur_preset_byte
         return data
-    
-    def _generate_thermostat(self, action: str, data: bytes, **kwargs: Any) -> bytes:
+
+    def _generate_thermostat(self, key: DeviceKey, action: str, data: bytes, **kwargs: Any) -> bytes:
+        current = self.gateway.registry.get(key)
+        cur_state = current.state if current and isinstance(current.state, dict) else {}
+        cur_hvac = cur_state.get("hvac_mode", HVACMode.OFF)
+        cur_preset = cur_state.get("preset_mode", PRESET_NONE)
+
         if action == "set_hvac":
             hm = kwargs["hvac_mode"]
             data[0] = 0x11 if hm == HVACMode.HEAT else 0x00
-            data[1] = 0x00
+            data[1] = 0x01 if cur_preset == PRESET_AWAY else 0x00
         elif action == "set_preset":
             pm = kwargs["preset_mode"]
-            data[0] = 0x11
+            data[0] = 0x11 if cur_hvac == HVACMode.HEAT else 0x00
             data[1] = 0x01 if pm == PRESET_AWAY else 0x00
         elif action == "set_temperature":
             tt = kwargs["target_temp"]
-            data[0] = 0x11
+            data[0] = 0x11 if cur_hvac == HVACMode.HEAT else 0x00
+            data[1] = 0x01 if cur_preset == PRESET_AWAY else 0x00
             data[2] = int(tt)
         return data
-    
-    def _generate_airconditioner(self, action: str, data: bytes, **kwargs: Any) -> bytes:
-        if action == "set_hvac":
-            hm = kwargs["hvac_mode"]
-            if hm == HVACMode.OFF:
+
+    def _generate_airconditioner(self, key: DeviceKey, action: str, data: bytes, **kwargs: Any) -> bytes:
+        current = self.gateway.registry.get(key)
+        cur_state = current.state if current and isinstance(current.state, dict) else {}
+        cur_hvac = cur_state.get("hvac_mode", HVACMode.OFF)
+        cur_fan = cur_state.get("fan_mode", FAN_LOW)
+
+        def _apply_power_and_mode(hvac_mode) -> None:
+            if hvac_mode == HVACMode.OFF:
                 data[0] = 0x00
             else:
                 data[0] = 0x10
-                data[1] = REV_AC_HVAC_MAP[hm]
+                data[1] = REV_AC_HVAC_MAP.get(hvac_mode, REV_AC_HVAC_MAP[HVACMode.COOL])
+                data[2] = REV_AC_FAN_MAP.get(cur_fan, REV_AC_FAN_MAP[FAN_LOW])
+
+        if action == "set_hvac":
+            hm = kwargs["hvac_mode"]
+            _apply_power_and_mode(hm)
         elif action == "set_fan":
             fm = kwargs["fan_mode"]
-            data[0] = 0x10
+            _apply_power_and_mode(cur_hvac)
             data[2] = REV_AC_FAN_MAP[fm]
         elif action == "set_temperature":
             tt = kwargs["target_temp"]
-            data[0] = 0x10
+            _apply_power_and_mode(cur_hvac)
             data[5] = int(tt)
         return data
     

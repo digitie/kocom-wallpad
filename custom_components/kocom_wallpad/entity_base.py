@@ -30,6 +30,8 @@ ENTITY_DESCRIPTION_MAP = {
 class KocomBaseEntity(RestoreEntity):
     """Base class for Kocom entities."""
 
+    _attr_should_poll = False  # push-only: all updates arrive via the gateway dispatcher
+
     def __init__(self, gateway, device) -> None:
         """Initialize the base entity."""
         super().__init__()
@@ -37,7 +39,10 @@ class KocomBaseEntity(RestoreEntity):
         self._device = device
         self._unsubs: list[callable] = []
 
-        self._attr_unique_id = f"{device.key.unique_id}:{self.gateway.host}"
+        # NOTE: keyed by the config entry id (stable across host/IP changes),
+        # not self.gateway.host. Changing this after entities already exist
+        # is itself a breaking change for those installs - see PR notes.
+        self._attr_unique_id = f"{device.key.unique_id}:{self.gateway.entry.entry_id}"
         self.entity_description = ENTITY_DESCRIPTION_MAP[self._device.platform](
             key=self.format_key,
             has_entity_name=True,
@@ -46,7 +51,7 @@ class KocomBaseEntity(RestoreEntity):
         )
         self._attr_device_info = DeviceInfo(
             connections={(self.gateway.host, self.unique_id)},
-            identifiers={(DOMAIN, f"{self.format_identifiers}")},
+            identifiers={(DOMAIN, f"{self.gateway.entry.entry_id}_{self.format_identifiers}")},
             manufacturer="KOCOM Co., Ltd",
             model="Smart Wallpad",
             name=f"{self.format_identifiers}",
@@ -80,6 +85,10 @@ class KocomBaseEntity(RestoreEntity):
         else:
             return f"KOCOM {self._device.key.device_type.name}"
 
+    @property
+    def available(self) -> bool:
+        return self.gateway.conn._is_connected()
+
     async def async_added_to_hass(self):
         sig = self.gateway.async_signal_device_updated(self._device.key.unique_id)
 
@@ -101,9 +110,19 @@ class KocomBaseEntity(RestoreEntity):
     def update_from_state(self) -> None:
         self.async_write_ha_state()
 
+    # Keys in KocomController._device_storage that aren't scoped to one
+    # device's unique_id (shared across all ventilation/elevator entities).
+    _GLOBAL_STORAGE_KEYS = ("ventil_feature", "ventil_modes", "available_floor")
+
     @property
     def extra_restore_state_data(self) -> RestoredExtraData:
+        uid = self._device.key.unique_id
+        full_storage = self.gateway.controller._device_storage
+        own_storage = {
+            k: v for k, v in full_storage.items()
+            if k.startswith(f"{uid}_") or k in self._GLOBAL_STORAGE_KEYS
+        }
         return RestoredExtraData({
             "packet": getattr(self._device, "_packet", bytes()).hex(),
-            "device_storage": self.gateway.controller._device_storage
+            "device_storage": own_storage
         })
