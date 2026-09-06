@@ -49,12 +49,16 @@ class AsyncConnection:
         self._touch()
 
     async def open(self) -> None:
-        try:
-            await self._connect_once()
-        except Exception as e:
-            LOGGER.warning("Connection open failed: %r", e)
-            self._connected = False
-            await self.reconnect()
+        """Attempt the initial connection once and raise on failure.
+
+        This intentionally does not fall back to the infinite-retry reconnect()
+        loop: the caller (KocomGateway.async_start, during config entry setup)
+        needs a bounded failure so Home Assistant can raise ConfigEntryNotReady
+        and use its own retry-with-backoff instead of blocking setup forever.
+        Recovering an already-established connection that drops later is
+        handled separately by send()/recv() calling reconnect().
+        """
+        await self._connect_once()
 
     async def _close_writer(self) -> None:
         if self._writer is None:
@@ -96,7 +100,7 @@ class AsyncConnection:
             LOGGER.warning("Send failed: %r", e)
             self._connected = False
             await self.reconnect()
-            return 0
+            raise
 
     async def recv(self, nbytes: int, timeout: float = 0.05) -> bytes:
         if not self._reader:

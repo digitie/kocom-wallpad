@@ -20,6 +20,8 @@ from .const import (
     IDLE_GAP_SEC,
     SEND_RETRY_MAX,
     SEND_RETRY_GAP,
+    MAX_TX_QUEUE_SIZE,
+    CMD_STALE_AFTER_SEC,
     DeviceType,
 )
 from .models import DeviceKey, DeviceState
@@ -33,6 +35,7 @@ class _CmdItem:
     action: str
     kwargs: dict
     future: asyncio.Future = field(default_factory=asyncio.get_running_loop().create_future)
+    enqueued_at: float = field(default_factory=lambda: asyncio.get_running_loop().time())
 
 
 class _PendingWaiter:
@@ -121,7 +124,8 @@ class KocomGateway:
         self.conn = AsyncConnection(host=host, port=port)
         self.controller = KocomController(self)
         self.registry = EntityRegistry()
-        self._tx_queue: asyncio.Queue[_CmdItem] = asyncio.Queue()
+        self._tx_queue: asyncio.Queue[_CmdItem] = asyncio.Queue(maxsize=MAX_TX_QUEUE_SIZE)
+        self._current_item: _CmdItem | None = None
         self._task_reader: asyncio.Task | None = None
         self._task_sender: asyncio.Task | None = None
         self._pendings: list[_PendingWaiter] = []
@@ -148,6 +152,19 @@ class KocomGateway:
             self._task_sender.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task_sender
+        # A command could have been mid-flight (or still queued) when the
+        # sender task was cancelled; without this, whoever is awaiting
+        # async_send_action() for it would hang forever.
+        if self._current_item and not self._current_item.future.done():
+            self._current_item.future.set_result(False)
+        self._current_item = None
+        while True:
+            try:
+                leftover = self._tx_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if leftover and not leftover.future.done():
+                leftover.future.set_result(False)
         await self.conn.close()
 
     def is_idle(self) -> bool:
@@ -163,14 +180,26 @@ class KocomGateway:
                 chunk = await self.conn.recv(512, RECV_POLL_SEC)
                 if chunk:
                     self._last_rx_monotonic = asyncio.get_running_loop().time()
-                    self.controller.feed(chunk)
+                    try:
+                        self.controller.feed(chunk)
+                    except Exception:
+                        # A bug in packet handling must not kill the read loop -
+                        # that would silently stop all future state updates.
+                        LOGGER.exception("Error while processing received chunk: %s", chunk.hex())
         except asyncio.CancelledError:
             LOGGER.debug("Read loop cancelled")
             raise
 
     async def async_send_action(self, key: DeviceKey, action: str, **kwargs) -> bool:
         item = _CmdItem(key=key, action=action, kwargs=kwargs)
-        await self._tx_queue.put(item)
+        try:
+            self._tx_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            LOGGER.warning(
+                "Command queue full (max %d); dropping '%s' for %s",
+                MAX_TX_QUEUE_SIZE, action, key,
+            )
+            return False
         try:
             res = await item.future   # 워커가 set_result(True/False)
             return bool(res)
@@ -234,7 +263,11 @@ class KocomGateway:
         self._force_register_uid = None
         device_storage = state.extra_data.as_dict().get("device_storage", {})
         LOGGER.debug("Restore state -> device_storage: %s", device_storage)
-        self.controller._device_storage = device_storage
+        # Merge rather than replace: each entity now only stores its own
+        # slice of _device_storage (see KocomBaseEntity.extra_restore_state_data),
+        # so replacing the whole dict here would drop every other entity's
+        # data as soon as more than one entity is restored in this loop.
+        self.controller._device_storage.update(device_storage)
 
     async def async_get_entity_registry(self) -> None:
         self._restore_mode = True
@@ -292,6 +325,19 @@ class KocomGateway:
                 item = await self._tx_queue.get()
                 if item is None:
                     continue
+                self._current_item = item
+
+                age = asyncio.get_running_loop().time() - item.enqueued_at
+                if age > CMD_STALE_AFTER_SEC:
+                    LOGGER.warning(
+                        "Dropping stale command '%s' for %s (queued %.1fs ago, > %.0fs limit).",
+                        item.action, item.key, age, CMD_STALE_AFTER_SEC,
+                    )
+                    if not item.future.done():
+                        item.future.set_result(False)
+                    self._current_item = None
+                    self._tx_queue.task_done()
+                    continue
 
                 # generate packet & expect predicate
                 try:
@@ -302,6 +348,7 @@ class KocomGateway:
                     LOGGER.exception("generate_command failed: %s", e)
                     if not item.future.done():
                         item.future.set_result(False)
+                    self._current_item = None
                     self._tx_queue.task_done()
                     continue
 
@@ -354,6 +401,7 @@ class KocomGateway:
                 if not item.future.done():
                     item.future.set_result(success)
 
+                self._current_item = None
                 self._tx_queue.task_done()
         except asyncio.CancelledError:
             LOGGER.debug("Sender loop cancelled")

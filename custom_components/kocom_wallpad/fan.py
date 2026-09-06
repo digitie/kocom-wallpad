@@ -62,7 +62,7 @@ class KocomFan(KocomBaseEntity, FanEntity):
             FanEntityFeature.TURN_OFF |
             FanEntityFeature.TURN_ON
         )
-        if device.attribute["feature_preset"]:
+        if device.attribute.get("feature_preset", False):
             self._attr_supported_features |= FanEntityFeature.PRESET_MODE
 
     @property
@@ -104,6 +104,12 @@ class KocomFan(KocomBaseEntity, FanEntity):
         preset_mode: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
+        if percentage is not None:
+            await self.async_set_percentage(percentage)
+            return
+        if preset_mode is not None:
+            await self.async_set_preset_mode(preset_mode)
+            return
         await self.gateway.async_send_action(self._device.key, "turn_on")
 
     async def async_turn_off(self, **kwargs: Any) -> None:
