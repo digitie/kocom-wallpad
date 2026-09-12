@@ -1,5 +1,4 @@
 {
-  "name": "Kocom Wallpad",
-  "render_readme": true,
+  "name": "Kocom Wallpad (Digitie)",
   "homeassistant": "2025.2.2"
 }
